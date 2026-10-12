@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DuoBot Test Harness</title>
+<style>
+  body { font-family: sans-serif; padding: 20px; background: #131f24; color: #e4eaf0; }
+  h2 { color: #6c5ce7; }
+  .test { margin: 10px 0; padding: 10px; background: #1a2735; border-radius: 8px; }
+  .pass { border-left: 4px solid #00d68f; }
+  .fail { border-left: 4px solid #ff5252; }
+  pre { background: #0f1923; padding: 8px; border-radius: 6px; font-size: 12px; overflow-x: auto; }
+  button { padding: 8px 16px; background: #6c5ce7; color: white; border: none; border-radius: 8px; cursor: pointer; margin: 4px; }
+</style>
+</head>
+<body>
+<h2>🤖 DuoBot — Test Harness</h2>
+<p>Tests the core logic (React prop extraction, challenge dispatch, input injection) without needing Duolingo.</p>
+<div id="results"></div>
+<hr>
+<h3>Live DOM Tests</h3>
+<div id="dom-tests">
+  <!-- Simulated Duolingo challenge DOM -->
+  <div data-test="challenge challenge-assist" id="mock-challenge">
+    <div data-test="challenge-choice">Option A</div>
+    <div data-test="challenge-choice">Option B (correct)</div>
+    <div data-test="challenge-choice">Option C</div>
+  </div>
+  <div style="margin-top:10px">
+    <div data-test="challenge-tap-token-text">The</div>
+    <div data-test="challenge-tap-token-text">cat</div>
+    <div data-test="challenge-tap-token-text">is</div>
+    <div data-test="challenge-tap-token-text">big</div>
+  </div>
+  <textarea data-test="challenge-translate-input" rows="2" style="width:100%;margin-top:8px"></textarea>
+  <input data-test="challenge-text-input" style="width:100%;margin-top:8px" />
+  <div data-test="player-next" aria-disabled="true" style="margin-top:8px;padding:8px;background:#333;border-radius:6px;cursor:pointer">
+    [player-next] — aria-disabled=true
+  </div>
+</div>
+<hr>
+<button onclick="runTests()">▶ Run All Tests</button>
+<button onclick="testDOMClick()">Test DOM Click</button>
+<button onclick="testDynamicInput()">Test Dynamic Input</button>
+<button onclick="testDeepFind()">Test Deep Find Challenge</button>
+
+<script>
+// ── Copy of core functions from the userscript for testing ───────────
+
+function getProps(el) {
+  const k = Object.keys(el).find(x => /^__reactProps/.test(x));
+  return k ? el[k] : null;
+}
+
+function deepFindChallenge(obj, d = 0, seen = new Set()) {
+  if (!obj || d > 25 || seen.has(obj)) return null;
+  if (typeof obj !== 'object') return null;
+  seen.add(obj);
+
+  const isCh = x => x && typeof x === 'object' && (x.type || x.challengeType);
+  if (isCh(obj.challenge)) return obj.challenge;
+  if (isCh(obj.currentChallenge)) return obj.currentChallenge;
+  if (isCh(obj.activeChallenge)) return obj.activeChallenge;
+  if (isCh(obj.storyChallenge)) return obj.storyChallenge;
+  if (isCh(obj.question)) return obj.question;
+
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      const r = deepFindChallenge(obj[i], d + 1, seen);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  for (const k of Object.keys(obj)) {
+    if (k === '_owner' || k === '_source' || k === '_self' || k === 'stateNode' || k === 'child' || k === 'sibling' || k === 'return') continue;
+    try {
+      if (typeof obj[k] === 'object' && obj[k] !== null) {
+        const r = deepFindChallenge(obj[k], d + 1, seen);
+        if (r) return r;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+function dynamicInput(el, text) {
+  if (!el) return;
+  const tag = el.tagName === 'SPAN' ? 'textContent' : 'value';
+  const last = el[tag];
+  el[tag] = text;
+  const ev = new Event('input', { bubbles: true });
+  ev.simulated = true;
+  const tracker = el._valueTracker;
+  if (tracker) tracker.setValue(last);
+  el.dispatchEvent(ev);
+}
+
+function getChallengeType() {
+  const el = document.querySelector('[data-test*="challenge challenge-"]');
+  if (!el) return null;
+  const parts = el.dataset.test.split(' ');
+  return parts.find(p => p.startsWith('challenge-')) ?? null;
+}
+
+function isLegendarySession(ch, path = 'https://www.duolingo.com/lesson') {
+  return !!ch && (ch.type === 'legendary' || ch.metadata?.isLegendary || path.includes('/legendary'));
+}
+
+// v3.6.3/3.6.4: tap tokens (scoped ke word-bank dulu), fallback ke getTargetWords kalau correctIndices kosong
+function solveTapIdx(ch) {
+  let toks = Array.from(document.querySelectorAll('[data-test="word-bank"] [data-test="challenge-tap-token-text"]'));
+  if (!toks.length) toks = Array.from(document.querySelectorAll('[data-test="challenge-tap-token-text"]'));
+  if (Array.isArray(ch.correctIndices) && ch.correctIndices.length) {
+    let n = 0;
+    for (const i of ch.correctIndices) if (toks[i]) { toks[i].dispatchEvent(new MouseEvent('click', { bubbles: true })); n++; }
+    return n > 0;
+  }
+  const target = getTargetWords(ch, []);
+  if (target.length && toks.length) {
+    const used = []; let n = 0;
+    for (const w of target) {
+      const cw = cleanPillText(w);
+      for (let i = 0; i < toks.length; i++) {
+        if (used.includes(i)) continue;
+        if (cleanPillText(toks[i].innerText) === cw) { toks[i].dispatchEvent(new MouseEvent('click', { bubbles: true })); used.push(i); n++; break; }
+      }
+    }
+    return n > 0;
+  }
+  return false;
+}
+
+// v3.6.5: story player — arrange chips stories-choice sesuai correctTokens/correctIndices, fallback choice/token/pairs
+function solveStory(ch) {
+  if (Array.isArray(ch.correctTokens) && ch.correctTokens.length) {
+    const chips = document.querySelectorAll('[data-test="stories-choice"]');
+    const used = []; let n = 0;
+    for (const w of ch.correctTokens) {
+      const cw = cleanPillText(w);
+      for (let i = 0; i < chips.length; i++) {
+        if (used.includes(i)) continue;
+        if (cleanPillText(chips[i].innerText) === cw) { chips[i].dispatchEvent(new MouseEvent('click', { bubbles: true })); used.push(i); n++; break; }
+      }
+    }
+    if (n > 0) return true;
+  }
+  if (Array.isArray(ch.correctIndices) && ch.correctIndices.length) {
+    const chips = document.querySelectorAll('[data-test="stories-choice"]');
+    let n = 0;
+    for (const i of ch.correctIndices) if (chips[i]) { chips[i].dispatchEvent(new MouseEvent('click', { bubbles: true })); n++; }
+    if (n > 0) return true;
+  }
+  const idx = ch.correctAnswerIndex ?? ch.correctIndex;
+  if (idx !== undefined) {
+    const opts = document.querySelectorAll('[data-test="stories-choice"],[data-test="challenge-choice"]');
+    if (opts[idx]) { opts[idx].dispatchEvent(new MouseEvent('click', { bubbles: true })); return true; }
+  }
+  if (ch.correctTokens?.length || ch.correctIndices?.length) return solveTapIdx(ch);
+  if (ch.pairs) return false;
+  return false;
+}
+
+// v3.6.6: deteksi layar selesai lesson (end overlay / replay button)
+function lessonDone() {
+  return !!document.querySelector('[data-test="player-practice-again"], [data-test="player-done"], [data-test="stories-player-done"]');
+}
+
+function normText(s){
+  return String(s||'').toLowerCase().replace(/[\u2026…_.*·•]+/g,' ').replace(/\s+/g,' ').trim();
+}
+
+function getTargetWords(ch, pillTexts){
+  if(Array.isArray(ch.correctTokens)&&ch.correctTokens.length){
+    const toks=ch.correctTokens.map(x=>typeof x==='string'?x:(x?.text||x?.token||x?.word||'')).map(s=>String(s).trim()).filter(Boolean);
+    if(toks.length)return toks;
+  }
+  if(Array.isArray(ch.displayTokens)){
+    const blanks=ch.displayTokens.filter(t=>t.isBlank||t.damageStart!==undefined);
+    if(blanks.length){
+      const words=blanks.map(t=>(t.damageStart!==undefined?t.text?.slice(t.damageStart):t.text)||'').filter(Boolean);
+      if(words.length)return words;
+    }
+  }
+  const pool=ch.choices||ch.tokens;
+  if(Array.isArray(ch.correctIndices)&&pool?.length){
+    return ch.correctIndices.map(i=>{
+      const c=pool[i];
+      return typeof c==='string'?c:(c?.text||c?.phrase||c?.word||c?.translation||c?.value||c?.display||'');
+    }).filter(Boolean);
+  }
+  const idx=ch.correctIndex??ch.correctIndices?.[0];
+  if(ch.choices&&idx!==undefined&&ch.choices[idx]){
+    const c=ch.choices[idx];
+    const s=typeof c==='string'?c:(c?.text||c?.phrase||c?.word||c?.translation||c?.value||c?.display||'');
+    if(s)return [s];
+  }
+  if(ch.correctSolutions?.[0]&&pillTexts?.length){
+    const sol=ch.correctSolutions[0].toLowerCase();
+    const matches=[];
+    for(const pt of pillTexts){
+      if(pt&&sol.includes(pt))matches.push({text:pt,idx:sol.indexOf(pt)});
+    }
+    if(matches.length){
+      matches.sort((a,b)=>a.idx-b.idx);
+      return matches.map(m=>m.text);
+    }
+  }
+  return [];
+}
+
+function getPillText(el){
+  return cleanPillText(el?.innerText||el?.textContent||'');
+}
+
+// Pitfall #1: strip keyboard shortcut numbers rendered inside pill ("1\nbooks")
+function cleanPillText(raw){
+  return (raw||'').replace(/^\s*\d+[\s\n\r]+/, '').replace(/[\s\n\r]+\d+\s*$/, '').trim().toLowerCase();
+}
+
+function getPills(){
+  return Array.from(document.querySelectorAll(
+    '[data-test*="tap-token"], [data-test*="choice"], [data-test="word-bank"] button, ' +
+    '[data-test="word-bank"] [role="button"], [role="radiogroup"] [role="radio"], [data-test="stories-choice"]'
+  )).filter(el=>{
+    if(el.getAttribute('aria-disabled')==='true'||el.disabled)return false;
+    const txt=(el.innerText||el.textContent||'').trim();
+    return txt&&txt.length<=50;
+  });
+}
+
+// v3.6.7: index mengacu kontainer choice terstruktur, bukan union pills; tidak menebak pill pertama
+function solveChoiceOrToken(ch){
+  const pills=getPills();
+  if(!pills.length)return false;
+  const targetWords=getTargetWords(ch,pills);
+  if(targetWords.length){
+    const clicked=new Set();let any=false;
+    for(const target of targetWords){
+      const cw=cleanPillText(target);
+      let m=pills.find(p=>!clicked.has(p)&&getPillText(p)===cw);
+      if(!m){const bare=cw.replace(/[^\p{L}\p{N}]/gu,'');m=pills.find(p=>!clicked.has(p)&&getPillText(p).replace(/[^\p{L}\p{N}]/gu,'')===bare);}
+      if(m){m.dispatchEvent(new MouseEvent('click',{bubbles:true}));clicked.add(m);any=true;}
+    }
+    if(any)return true;
+  }
+  const idx=ch?.correctIndex??ch?.correctIndices?.[0];
+  if(idx!==undefined){
+    const opts=Array.from(document.querySelectorAll(
+      '[data-test="challenge-choice"], [data-test="challenge-choice-card"], [data-test="challenge-judge-text"], ' +
+      '[data-test*="challenge-select"] [role="radio"], [role="radiogroup"] [role="radio"]'
+    ));
+    const pool=opts.length?opts:pills;
+    if(pool.length){const t=pool[idx]||pool[0];if(t){t.dispatchEvent(new MouseEvent('click',{bubbles:true}));return true;}}
+  }
+  const wbPills=pills.filter(p=>p.closest('[data-test="word-bank"]'));
+  const blankCnt=(ch?.displayTokens||[]).filter(t=>t.isBlank||t.damageStart!==undefined).length;
+  if(wbPills.length>0&&blankCnt>0&&wbPills.length===blankCnt){
+    for(const p of wbPills)p.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+    return true;
+  }
+  const structured=document.querySelectorAll('[data-test="challenge-choice"], [data-test="challenge-choice-card"]');
+  if(!structured.length&&!ch?.choices?.length&&pills[0]){pills[0].dispatchEvent(new MouseEvent('click',{bubbles:true}));return true;}
+  return false;
+}
+
+const clickEv = () => new MouseEvent('click', { view: window, bubbles: true, cancelable: false });
+
+// ── Test framework ──────────────────────────────────────────────────
+
+const results = document.getElementById('results');
+
+function assert(name, condition, detail = '') {
+  const div = document.createElement('div');
+  div.className = 'test ' + (condition ? 'pass' : 'fail');
+  div.textContent = (condition ? '✅' : '❌') + ' ' + name + (detail ? ' — ' + detail : '');
+  results.appendChild(div);
+  return condition;
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+function runTests() {
+  results.innerHTML = '';
+
+  // 1. deepFindChallenge — flat
+  const flat = { challenge: { type: 'assist', correctIndex: 1 } };
+  const r1 = deepFindChallenge(flat, 0);
+  assert('deepFind flat', r1?.type === 'assist', `got: ${r1?.type}`);
+
+  // 2. deepFindChallenge — nested 5 levels
+  const nested = { a: { b: { c: { d: { challenge: { type: 'translate', correctTokens: ['hi'] } } } } } };
+  const r2 = deepFindChallenge(nested, 0);
+  assert('deepFind nested', r2?.type === 'translate', `got: ${r2?.type}`);
+
+  // 3. deepFindChallenge — in array
+  const arr = { children: [null, { challenge: { type: 'match', pairs: [] } }] };
+  const r3 = deepFindChallenge(arr, 0);
+  assert('deepFind in array', r3?.type === 'match', `got: ${r3?.type}`);
+
+  // 4. deepFindChallenge — currentChallenge
+  const cc = { props: { currentChallenge: { type: 'listen', prompt: 'hello' } } };
+  const r4 = deepFindChallenge(cc, 0);
+  assert('deepFind currentChallenge', r4?.type === 'listen', `got: ${r4?.type}`);
+
+  // 5. deepFindChallenge — no challenge
+  const empty = { foo: { bar: 123 } };
+  const r5 = deepFindChallenge(empty, 0);
+  assert('deepFind no challenge', r5 === null, `got: ${r5}`);
+
+  // 6. deepFindChallenge — challenge without type (should not match)
+  const noType = { challenge: { correctIndex: 0 } };
+  const r6 = deepFindChallenge(noType, 0);
+  assert('deepFind challenge without type', r6 === null, `got: ${JSON.stringify(r6)}`);
+
+  // 7. getChallengeType from DOM
+  const ct = getChallengeType();
+  assert('getChallengeType from DOM', ct === 'challenge-assist', `got: ${ct}`);
+
+  // 7b. isLegendarySession (v3.6.2): legendary detection via type, metadata, AND /legendary route
+  assert('Legendary by type', isLegendarySession({ type: 'legendary' }) === true);
+  assert('Legendary by metadata', isLegendarySession({ type: 'gapFill', metadata: { isLegendary: true } }) === true);
+  assert('Legendary by route (pitfall #4)', isLegendarySession({ type: 'gapFill' }, 'https://www.duolingo.com/legendary/abc') === true);
+  assert('Normal lesson not legendary', isLegendarySession({ type: 'gapFill' }, 'https://www.duolingo.com/lesson') === false);
+  assert('Null challenge not legendary', isLegendarySession(null) === false);
+
+  // 7c. solveTapIdx (v3.6.3): kedetect tapi gak ke-tap — fallback saat correctIndices kosong
+  document.querySelectorAll('[data-test="challenge-tap-token-text"]').forEach(t => t.remove()); // bersihkan mock lama
+  const tapBox = document.createElement('div');
+  tapBox.innerHTML = `<div data-test="challenge-tap-token-text">the</div><div data-test="challenge-tap-token-text">cat</div><div data-test="challenge-tap-token-text">sat</div>`;
+  tapBox.style.display = 'none';
+  document.body.appendChild(tapBox);
+  const taps = [];
+  tapBox.querySelectorAll('[data-test="challenge-tap-token-text"]').forEach(t => t.addEventListener('click', () => taps.push(t.textContent)));
+  assert('tapComplete by correctIndices', solveTapIdx({ type: 'tapComplete', correctIndices: [0, 2] }) === true && taps.join(',') === 'the,sat', `got: ${taps.join(',')}`);
+  taps.length = 0;
+  assert('tapComplete fallback correctTokens', solveTapIdx({ type: 'tapComplete', correctTokens: ['sat', 'cat'] }) === true && taps.join(',') === 'sat,cat', `got: ${taps.join(',')}`);
+  taps.length = 0;
+  assert('tapComplete no data -> false', solveTapIdx({ type: 'tapComplete', correctIndices: [] }) === false && taps.length === 0);
+
+  // 7d. normText (v3.6.4): matcher fill-in-the-blank — blank …/_/spasi kolaps
+  assert('normText blank collapse', normText('I ___ up early today') === 'i up early today', `got: ${normText('I ___ up early today')}`);
+  assert('normText ellipsis', normText('Dia … makan nasi') === 'dia makan nasi', `got: ${normText('Dia … makan nasi')}`);
+  assert('normText case & multi-space', normText('  HELLO   world ') === 'hello world', `got: ${normText('  HELLO   world ')}`);
+
+  // 7e. word-bank scoping (v3.6.4): correctIndices mengindeks token di word-bank saja
+  const wbBox = document.createElement('div');
+  wbBox.innerHTML = `<div data-test="word-bank"><div data-test="challenge-tap-token-text">a</div><div data-test="challenge-tap-token-text">b</div><div data-test="challenge-tap-token-text">c</div></div><div><div data-test="challenge-tap-token-text">x</div><div data-test="challenge-tap-token-text">y</div></div>`;
+  wbBox.style.display = 'none';
+  document.body.appendChild(wbBox);
+  const wbTaps = [];
+  wbBox.querySelectorAll('[data-test="challenge-tap-token-text"]').forEach(t => t.addEventListener('click', () => wbTaps.push(t.textContent)));
+  assert('tapCompleteTable scope word-bank', solveTapIdx({ type: 'tapCompleteTable', correctIndices: [0, 2] }) === true && wbTaps.join(',') === 'a,c', `got: ${wbTaps.join(',')}`);
+  assert('tokens di luar word-bank tak diklik', wbTaps.length === 2);
+  wbBox.remove();
+
+  // 7f. solveStory (v3.6.5): arrange story — chip stories-choice diklik berurutan (gak nge-arrange fix)
+  const storyBox = document.createElement('div');
+  storyBox.innerHTML = `<div data-test="stories-choice">1&#10;it</div><div data-test="stories-choice">2&#10;works</div><div data-test="stories-choice">3&#10;Oscar</div>`;
+  storyBox.style.display = 'none';
+  document.body.appendChild(storyBox);
+  const storyTaps = [];
+  storyBox.querySelectorAll('[data-test="stories-choice"]').forEach(t => t.addEventListener('click', () => storyTaps.push(cleanPillText(t.textContent))));
+  assert('story arrange by correctTokens (urutan)', solveStory({ type: 'arrange', correctTokens: ['it', 'works'] }) === true && storyTaps.join(',') === 'it,works', `got: ${storyTaps.join(',')}`);
+  storyTaps.length = 0;
+  assert('story arrange by correctIndices', solveStory({ type: 'arrange', correctIndices: [2, 0] }) === true && storyTaps.join(',') === 'oscar,it', `got: ${storyTaps.join(',')}`);
+  storyTaps.length = 0;
+  assert('story multipleChoice by index', solveStory({ type: 'multipleChoice', correctAnswerIndex: 1 }) === true && storyTaps.join(',') === 'works', `got: ${storyTaps.join(',')}`);
+  storyTaps.length = 0;
+  assert('story tanpa data -> false', solveStory({ type: 'arrange' }) === false && storyTaps.length === 0);
+  storyBox.remove();
+
+  // 7g. lessonDone (v3.6.6): deteksi end-screen lesson untuk Auto Next
+  const doneBox = document.createElement('div');
+  document.body.appendChild(doneBox);
+  assert('lesson belum selesai -> false', lessonDone() === false);
+  doneBox.innerHTML = '<div data-test="player-practice-again"></div>';
+  assert('lesson selesai (player-practice-again)', lessonDone() === true);
+  doneBox.innerHTML = '<div data-test="stories-player-done"></div>';
+  assert('story selesai (stories-player-done)', lessonDone() === true);
+  doneBox.remove();
+
+  // 7h. solveChoiceOrToken (v3.6.7): index mengacu kontainer choice, bukan union pills; tanpa tebak pill pertama
+  const ccBox = document.createElement('div');
+  ccBox.style.display = 'none';
+  // elemen "tap-token" jebakan di depan (bikin urutan pills union bergeser)
+  ccBox.innerHTML = `<div data-test="challenge-prompt-tap-token"></div>
+    <div data-test="challenge-choice">will</div>
+    <div data-test="challenge-choice">would</div>
+    <div data-test="challenge-choice">are</div>`;
+  document.body.appendChild(ccBox);
+  const ccTaps = [];
+  ccBox.querySelectorAll('[data-test="challenge-choice"]').forEach(t => t.addEventListener('click', () => ccTaps.push(t.textContent)));
+  assert('choice correctIndex=1 pilih opsi-2 (bukan pills[1])',
+    solveChoiceOrToken({ type: 'assist', choices: ['will','would','are'], correctIndex: 1 }) === true && ccTaps.join(',') === 'would', `got: ${ccTaps.join(',')}`);
+  ccTaps.length = 0;
+  assert('choice tanpa data -> false, tidak tebak',
+    solveChoiceOrToken({ type: 'assist', choices: [] }) === false && ccTaps.length === 0, `got: ${ccTaps.join(',')}`);
+  ccTaps.length = 0;
+  // correctTokens object + blank count cocok: klik tepat target
+  ccBox.innerHTML = `<div data-test="word-bank"><div data-test="challenge-tap-token-text">will</div><div data-test="challenge-tap-token-text">be</div></div>`;
+  const wbTaps2 = [];
+  ccBox.querySelectorAll('[data-test="challenge-tap-token-text"]').forEach(t => t.addEventListener('click', () => wbTaps2.push(t.textContent)));
+  assert('fill correctTokens object token', getTargetWords({ correctTokens: [{ text: 'be' }] }, ['will','be']).join(',') === 'be', `got: ${getTargetWords({ correctTokens: [{ text: 'be' }] }, ['will','be']).join(',')}`);
+  ccBox.remove();
+
+  // 8. Challenge dispatch table coverage
+  const CHOICE = ['assist','characterIntro','characterPuzzle','characterSelect',
+    'definition','dialogue','dialogueAssist','form','gapFill','gapFillSelect',
+    'imageAssist','imageSelect','judge','listenIsolation','select',
+    'selectPronunciation','selectTranscription','readComprehension',
+    'listenComprehension','sameDifferent'];
+  const FILL = ['completeReverseTranslation','partialReverseTranslate',
+    'partialReverseTranslation','typeCloze','typeComplete','fillInBlank'];
+  const MATCH = ['match','characterMatch','listenMatch'];
+  const SKIP = ['speak','readAloud','freeResponse','listenSpeak','characterTrace','characterWrite'];
+  const allTypes = [...CHOICE, ...FILL, ...MATCH, ...SKIP, 'translate','listenTap','listen','listenTyped','tapComplete','tapCompleteTable','tapDescribe','typeAnswer','name'];
+  assert('Type coverage', allTypes.length >= 35, `${allTypes.length} types handled`);
+
+  // 9. Simulated challenge objects for each type
+  const mockChallenges = [
+    { type: 'assist',     correctIndex: 1 },
+    { type: 'translate',  correctTokens: ['The','cat'] },
+    { type: 'translate',  correctSolutions: ['The cat'] },
+    { type: 'listen',     prompt: 'Hello world' },
+    { type: 'match',      pairs: [{ fromToken: 'cat', learningToken: 'gato' }] },
+    { type: 'completeReverseTranslation', displayTokens: [
+      { isBlank: false, text: 'El' },
+      { isBlank: true,  text: 'gato' },
+    ]},
+    { type: 'tapComplete', correctIndices: [0, 2] },
+  ];
+  for (const mc of mockChallenges) {
+    const found = deepFindChallenge({ challenge: mc }, 0);
+    assert(`Mock ${mc.type}`, found?.type === mc.type);
+  }
+
+  // 10. Test getProps on non-React element (should return null)
+  const div = document.createElement('div');
+  assert('getProps non-React', getProps(div) === null);
+
+  // 11. Test getProps on simulated React element
+  const rEl = document.createElement('div');
+  rEl['__reactProps$abc123'] = { children: { challenge: { type: 'assist', correctIndex: 0 } } };
+  const rProps = getProps(rEl);
+  assert('getProps simulated React', rProps !== null && rProps.children.challenge.type === 'assist');
+
+  // 13. Image 1 test: Fill in the blanks (multi-word)
+  const chImg1 = {
+    type: 'tapCloze',
+    displayTokens: [
+      { text: 'Do', isBlank: false },
+      { text: 'what', isBlank: false },
+      { text: 'I', isBlank: true },
+      { text: 'need', isBlank: true }
+    ],
+    correctTokens: ['I', 'need']
+  };
+  const mockPillsImg1 = ['1\nI', '2\nneed'];
+  const targets1 = getTargetWords(chImg1, mockPillsImg1.map(cleanPillText));
+  assert('Image 1 multiple target words extracted', targets1.length === 2 && targets1[0] === 'I' && targets1[1] === 'need');
+
+  // 14. Image 2 test: Fill in the blank (choice with shortcut key)
+  const chImg2 = {
+    type: 'gapFill',
+    choices: ['pigs', 'books', 'ages', 'meals'],
+    correctIndex: 1,
+    correctSolutions: ['These books look similar, but the stories are different.']
+  };
+  const mockPillsImg2 = ['1\npigs', '2\nbooks', '3\nages', '4\nmeals'];
+  const targets2 = getTargetWords(chImg2, mockPillsImg2.map(cleanPillText));
+  assert('Image 2 target word extracted', targets2.length === 1 && targets2[0] === 'books');
+  assert('Image 2 clean pill matches target', cleanPillText(mockPillsImg2[1]) === targets2[0]);
+
+  // 15. Unit 15 Legendary test: Trigram matching + solution extraction
+  const sessionChallenges = [
+    {
+      type: 'gapFill',
+      prompt: 'Fill in the blank',
+      choices: ['sit', 'park', 'dream', 'build'],
+      correctIndex: 0,
+      correctSolutions: ['I like to sit in the front row because I can talk to the teacher.']
+    }
+  ];
+  const screenBody = 'fill in the blank i like to in the front row because i can talk to the teacher. sit park dream build check';
+  const screenPills = ['1\nsit', '2\npark', '3\ndream', '4\nbuild'];
+  function matchSessionChallenge(c, bodyText) {
+    if (c.choices?.length) {
+      const cChoices = c.choices.map(x => (typeof x === 'string' ? x : x.text || '').toLowerCase().trim());
+      const matchCount = cChoices.filter(ch => ch.length > 0 && bodyText.includes(ch)).length;
+      if (matchCount >= 2) return true;
+    }
+    if (Array.isArray(c.correctSolutions)) {
+      for (const sol of c.correctSolutions) {
+        const words = sol.toLowerCase().replace(/[^a-z0-9 ]/g, '').split(' ').filter(Boolean);
+        for (let i = 0; i <= words.length - 3; i++) {
+          const trigram = words.slice(i, i + 3).join(' ');
+          if (bodyText.includes(trigram)) return true;
+        }
+      }
+    }
+    return false;
+  }
+  const matchedLegendary = sessionChallenges.find(c => matchSessionChallenge(c, screenBody));
+  assert('Unit 15 Legendary matched from session cache', matchedLegendary?.type === 'gapFill');
+  const legendaryTarget = getTargetWords(matchedLegendary, screenPills.map(cleanPillText));
+  assert('Unit 15 Legendary target word is sit', legendaryTarget[0] === 'sit');
+}
+
+function testDOMClick() {
+  results.innerHTML += '<div class="test" style="border-left:4px solid #3da4f6">🔵 Testing DOM click dispatch...</div>';
+  const choices = document.querySelectorAll('[data-test="challenge-choice"]');
+  let clicked = false;
+  choices[1].addEventListener('click', () => {
+    clicked = true;
+    choices[1].style.background = '#00d68f';
+    choices[1].textContent += ' ✓ CLICKED';
+  }, { once: true });
+  choices[1].dispatchEvent(clickEv());
+  setTimeout(() => assert('DOM click dispatched', clicked), 100);
+}
+
+function testDynamicInput() {
+  results.innerHTML += '<div class="test" style="border-left:4px solid #3da4f6">🔵 Testing dynamicInput...</div>';
+  const ta = document.querySelector('[data-test="challenge-translate-input"]');
+  dynamicInput(ta, 'Hello from DuoBot');
+  assert('Textarea value set', ta.value === 'Hello from DuoBot', `got: "${ta.value}"`);
+
+  const inp = document.querySelector('[data-test="challenge-text-input"]');
+  dynamicInput(inp, 'test fill');
+  assert('Input value set', inp.value === 'test fill', `got: "${inp.value}"`);
+}
+
+function testDeepFind() {
+  results.innerHTML += '<div class="test" style="border-left:4px solid #3da4f6">🔵 Testing edge cases...</div>';
+
+  // Circular ref protection (depth limit)
+  const circ = {};
+  circ.self = circ;
+  circ.challenge = { type: 'assist', correctIndex: 0 };
+  const r = deepFindChallenge(circ, 0);
+  assert('Circular with challenge', r?.type === 'assist');
+
+  // Very deep nesting
+  let deep = { challenge: { type: 'deep', correctIndex: 5 } };
+  for (let i = 0; i < 25; i++) deep = { child: deep };
+  const rd = deepFindChallenge(deep, 0);
+  assert('25-level deep nesting', rd?.type === 'deep');
+
+  // Over depth limit (31 levels)
+  let tooDeep = { challenge: { type: 'gone', correctIndex: 0 } };
+  for (let i = 0; i < 35; i++) tooDeep = { child: tooDeep };
+  const rt = deepFindChallenge(tooDeep, 0);
+  assert('35-level (over limit) returns null', rt === null);
+}
+
+// ── Turbo loop tests (v3.6.8) ───────────────────────────────────────
+// Mirror dari duolingo-auto-lesson.user.js: challengeSig() + guard solvedSig.
+// Tidak menguji timer/await (butuh browser), hanya logika guard yang bisa
+// bikin React 18 deselect pill kalau loop jalan tanpa jeda.
+function challengeSig(ch) {
+  if (!ch) return '';
+  const pick = t => (typeof t === 'string' ? t : (t?.text || t?.word || t?.token || ''));
+  const cs = (ch.choices || []).map(pick).join('|');
+  return [ch.id || '', ch.type || ch.challengeType || '', ch.prompt || ch.sentence || '', cs, ch.correctIndex ?? ''].join('~');
+}
+
+function testTurbo() {
+  results.innerHTML += '<div class="test" style="border-left:4px solid #3da4f6">🔵 Testing turbo loop guard...</div>';
+
+  // 1. Sig stabil untuk soal yang sama (dipanggil berkali-kali, hasil sama)
+  const q1 = { id: 'c1', type: 'translate', choices: ['a', 'b'] };
+  assert('challengeSig stable for same question', challengeSig(q1) === challengeSig({ ...q1 }));
+
+  // 2. Sig berubah saat soal berikutnya muncul
+  const q2 = { id: 'c2', type: 'translate', choices: ['c', 'd'] };
+  assert('challengeSig differs for new question', challengeSig(q1) !== challengeSig(q2));
+
+  // 3. Sig berubah kalau pilihan berubah walau id sama (kasus choice di-render ulang)
+  assert('challengeSig differs when choices change',
+    challengeSig(q1) !== challengeSig({ ...q1, choices: ['a', 'b', 'c'] }));
+
+  // 4. Guard: siklus kedua untuk soal yang sama harus berhenti (return)
+  let executed = 0;
+  let solvedSig = null, retryAt = 0;
+  const cycle = (ch, now) => {
+    const sig = challengeSig(ch);
+    if (sig && sig === solvedSig && now < retryAt) return; // guard, sama seperti tick()
+    solvedSig = sig; retryAt = now + 1500;
+    executed++;
+  };
+  cycle(q1, 0); cycle(q1, 100); cycle(q1, 200);
+  assert('guard blocks repeated dispatch (3 ticks → 1 exec)', executed === 1, `executed=${executed}`);
+
+  // 5. Guard reset saat soal berganti → soal baru dieksekusi
+  cycle(q2, 300);
+  assert('new question passes guard', executed === 2, `executed=${executed}`);
+
+  // 6. Guard dilepas saat next diklik (solvedSig=null di tick)
+  solvedSig = null; retryAt = 0;
+  cycle(q2, 400);
+  assert('guard released after next click', executed === 3, `executed=${executed}`);
+
+  // 6b. Retry window: soal sama yang nyangkut >1.5s boleh dicoba ulang
+  cycle(q2, 5000);
+  assert('retry window allows re-attempt after timeout', executed === 4, `executed=${executed}`);
+
+  // 7. Object token (bukan string) di-normalisasi, tidak jadi "[object Object]"
+  const objTok = { id: 'c3', type: 'tapCloze', choices: [{ text: 'sit' }, { word: 'park' }] };
+  const sig = challengeSig(objTok);
+  assert('object choices normalized in sig', sig.includes('sit|park') && !sig.includes('[object'), `sig=${sig}`);
+
+  // 8. Periode self-loop: turbo harus jauh lebih cepat dari interval lama (1500ms)
+  const target = (safe) => safe ? Math.floor(Math.random() * 1400 + 900) : Math.floor(Math.random() * 120 + 110);
+  assert('turbo target period < 250ms', target(false) < 250, `got=${target(false)}ms`);
+  assert('safe target period >= 900ms', target(true) >= 900, `got=${target(true)}ms`);
+
+  // 9. v3.6.9: partial fiber {type,choices} tanpa correctIndex harus SKIP, bukan blind pills[0].
+  //    Screenshot gapFill: choices 3, correctIndex=1. Partial fiber → klik opsi 1 = salah.
+  const pWrap = document.createElement('div');
+  pWrap.id = 'p9';
+  const pEls = [];
+  for (const [i, txt] of ['a lot of money', 'a great job', 'a birthday cake'].map((t, i) => [i, t])) {
+    const b = document.createElement('button');
+    b.dataset && (b.dataset.test = 'tap-token');
+    b.setAttribute('data-test', 'tap-token');
+    b.textContent = `${i + 1}\n${txt}`;
+    pWrap.appendChild(b);
+    pEls.push(b);
+  }
+  document.body.appendChild(pWrap);
+  const partialCh = { type: 'gapFill', choices: ['a lot of money', 'a great job', 'a birthday cake'] };
+  let done9 = true;
+  const prev9 = window.__DUO_CHALLENGES__;
+  window.__DUO_CHALLENGES__ = []; // no cache → partial fiber must NOT blind pills[0]
+  const r9 = solveChoiceOrToken(partialCh);
+  window.__DUO_CHALLENGES__ = prev9;
+  assert('partial fiber (choices, no index) does NOT blind-click pills[0]',
+    r9 === false && pEls.every(p => !p.style.background),
+    `result=${r9}`);
+  pWrap.remove();
+
+  // 10. Cache full challenge (correctIndex) bezatus partial fiber: cache matched di-prioritikan
+  //     → target 'a great job' (index 1), bukan choices[0].
+  const body10 = 'you have done on your résumé. they\'re going to love you! a lot of money a great job a birthday cake';
+  const cached10 = { type: 'gapFill', choices: ['a lot of money', 'a great job', 'a birthday cake'], correctIndex: 1, correctSolutions: ['You have done a great job on your résumé. They\'re going to love you!'] };
+  const t10 = getTargetWords(cached10, ['a lot of money', 'a great job', 'a birthday cake']);
+  assert('cache challenge with correctIndex resolves word 2 (not blind first)',
+    t10.length === 1 && t10[0] === 'a great job', `got=${t10.join(',')}`);
+
+  // 11. hasAnswer: partial fiber tanpa field jawaban = false (kiby nodig skip)
+  const hasAnswer11 = (ch) => !!ch && (ch.correctIndex !== undefined || ch.correctIndices?.length || ch.correctTokens?.length || ch.correctSolutions?.length || ch.pairs?.length);
+  assert('hasAnswer falsy for partial choices-only fiber', !hasAnswer11(partialCh), `got=${hasAnswer11(partialCh)}`);
+  assert('hasAnswer true for full challenge', hasAnswer11(cached10) === true);
+}
+
+// Auto-run
+window.onload = () => {
+  runTests();
+  testDOMClick();
+  testDynamicInput();
+  testDeepFind();
+  testTurbo();
+};
+</script>
+</body>
+</html>
